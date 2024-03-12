@@ -3,7 +3,7 @@ import logging
 import sys
 import sqlite3
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from telegram.ext import Filters, MessageHandler, Updater, CallbackContext
 from telegram.error import BadRequest
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -30,20 +30,22 @@ def create_database():
 def add_user_to_db(chat_id, user_id, join_date):
     connection = sqlite3.connect('users.db')
     cursor = connection.cursor()
+    # Преобразование join_date в строку в формате ISO для хранения
     cursor.execute('''
         INSERT OR REPLACE INTO users (chat_id, user_id, join_date)
         VALUES (?, ?, ?)
-    ''', (chat_id, user_id, join_date))
+    ''', (chat_id, user_id, join_date.isoformat()))
     connection.commit()
     connection.close()
 
 def get_users_to_kick(chat_id, delta):
     connection = sqlite3.connect('users.db')
     cursor = connection.cursor()
+    # Использование текущей даты в UTC для расчета разницы
     cursor.execute('''
         SELECT user_id FROM users
         WHERE chat_id = ? AND
-        julianday('now') - julianday(join_date) > ?
+        julianday(datetime('now')) - julianday(join_date) > ?
     ''', (chat_id, delta.days))
     users = cursor.fetchall()
     connection.close()
@@ -65,7 +67,7 @@ def error_callback(update, context):
 def kickout(update, context):
     chat = update.effective_chat
     for new_user in update.effective_message.new_chat_members:
-        add_user_to_db(chat.id, new_user.id, datetime.now().isoformat())
+        add_user_to_db(chat.id, new_user.id, datetime.now(timezone.utc))
         logger.info(f'User {new_user.id} added to chat {chat.id}')
 
 def kick_old_users(context: CallbackContext):
