@@ -1,12 +1,11 @@
 import configparser
 import logging
-import sys
 import sqlite3
-import traceback
 from datetime import datetime, timedelta, timezone
 from telegram.ext import Filters, MessageHandler, Updater, CallbackContext
 from telegram.error import BadRequest
 from apscheduler.schedulers.background import BackgroundScheduler
+import pytz
 
 # Настройка логирования
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -30,7 +29,6 @@ def create_database():
 def add_user_to_db(chat_id, user_id, join_date):
     connection = sqlite3.connect('users.db')
     cursor = connection.cursor()
-    # Преобразование join_date в строку в формате ISO для хранения
     cursor.execute('''
         INSERT OR REPLACE INTO users (chat_id, user_id, join_date)
         VALUES (?, ?, ?)
@@ -41,7 +39,6 @@ def add_user_to_db(chat_id, user_id, join_date):
 def get_users_to_kick(chat_id, delta):
     connection = sqlite3.connect('users.db')
     cursor = connection.cursor()
-    # Использование текущей даты в UTC для расчета разницы
     cursor.execute('''
         SELECT user_id FROM users
         WHERE chat_id = ? AND
@@ -64,7 +61,7 @@ def remove_user_from_db(chat_id, user_id):
 def error_callback(update, context):
     logger.warning('Update "%s" caused error "%s"', update, context.error)
 
-def kickout(update, context):
+def kickout(update, context: CallbackContext):
     chat = update.effective_chat
     for new_user in update.effective_message.new_chat_members:
         add_user_to_db(chat.id, new_user.id, datetime.now(timezone.utc))
@@ -96,12 +93,12 @@ def main():
     dp.add_error_handler(error_callback)
     dp.add_handler(MessageHandler(Filters.status_update.new_chat_members, kickout))
 
-    # Настройка планировщика для ежедневной проверки и удаления пользователей
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(kick_old_users, 'interval', days=1, args=[updater], misfire_grace_time=3600)
+    # Настройка и запуск планировщика с указанием временной зоны
+    scheduler = BackgroundScheduler(timezone=pytz.utc)
+    # Важно заменить 'YOUR_CHAT_ID' на реальный ID чата
+    scheduler.add_job(kick_old_users, 'interval', days=1, args=[updater], misfire_grace_time=3600, kwargs={'chat_id': YOUR_CHAT_ID})
     scheduler.start()
 
-    # Запуск бота
     updater.start_polling()
     updater.idle()
 
