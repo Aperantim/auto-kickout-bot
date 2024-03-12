@@ -1,141 +1,107 @@
 import configparser
 import logging
 import sys
+import sqlite3
 import traceback
-
+from datetime import datetime, timedelta
+from telegram.ext import Filters, MessageHandler, Updater, CallbackContext
 from telegram.error import BadRequest
-from telegram.ext import Filters, MessageHandler, Updater
+from apscheduler.schedulers.background import BackgroundScheduler
 
-# Config
-config = configparser.ConfigParser()
-config.read('config.ini')
-
-
-# Log
-BASIC_FORMAT = '%(asctime)s - %(levelname)s - %(lineno)d - %(funcName)s - %(message)s'
-DATE_FORMAT = None
-basic_formatter = logging.Formatter(BASIC_FORMAT, DATE_FORMAT)
-
-
-class MaxFilter:
-    def __init__(self, max_level):
-        self.max_level = max_level
-
-    def filter(self, record):
-        if record.levelno <= self.max_level:
-            return True
-
-
-chlr = logging.StreamHandler(stream=sys.stdout)
-chlr.setFormatter(basic_formatter)
-chlr.setLevel('INFO')
-chlr.addFilter(MaxFilter(logging.INFO))
-
-ehlr = logging.StreamHandler(stream=sys.stderr)
-ehlr.setFormatter(basic_formatter)
-ehlr.setLevel('WARNING')
-
-fhlr = logging.handlers.TimedRotatingFileHandler(
-    'log/log', when='H', interval=1, backupCount=24*7)
-fhlr.setFormatter(basic_formatter)
-fhlr.setLevel('DEBUG')
-
-logger = logging.getLogger()
-logger.setLevel('NOTSET')
-logger.addHandler(fhlr)
-
+# Настройка логирования
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
-logger.setLevel('DEBUG')
-logger.addHandler(chlr)
-logger.addHandler(ehlr)
 
+# Создание и настройка базы данных
+def create_database():
+    connection = sqlite3.connect('users.db')
+    cursor = connection.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            chat_id INTEGER,
+            user_id INTEGER,
+            join_date TEXT,
+            PRIMARY KEY (chat_id, user_id)
+        )
+    ''')
+    connection.commit()
+    connection.close()
 
-# Error Callback
+def add_user_to_db(chat_id, user_id, join_date):
+    connection = sqlite3.connect('users.db')
+    cursor = connection.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO users (chat_id, user_id, join_date)
+        VALUES (?, ?, ?)
+    ''', (chat_id, user_id, join_date))
+    connection.commit()
+    connection.close()
+
+def get_users_to_kick(chat_id, delta):
+    connection = sqlite3.connect('users.db')
+    cursor = connection.cursor()
+    cursor.execute('''
+        SELECT user_id FROM users
+        WHERE chat_id = ? AND
+        julianday('now') - julianday(join_date) > ?
+    ''', (chat_id, delta.days))
+    users = cursor.fetchall()
+    connection.close()
+    return [user[0] for user in users]
+
+def remove_user_from_db(chat_id, user_id):
+    connection = sqlite3.connect('users.db')
+    cursor = connection.cursor()
+    cursor.execute('''
+        DELETE FROM users WHERE chat_id = ? AND user_id = ?
+    ''', (chat_id, user_id))
+    connection.commit()
+    connection.close()
+
+# Обработчики бота
 def error_callback(update, context):
     logger.warning('Update "%s" caused error "%s"', update, context.error)
 
-
 def kickout(update, context):
-    try:
-        chat = update.effective_chat
-        msg = update.effective_message
-        if len(msg.new_chat_members) > 1:
-            logger.info(f'[{chat.id}] {chat.title}: others added users')
-            return
-        new_user = msg.new_chat_members[0]
-        if new_user.id == config['BOT'].getint('id'):
-            logger.info(f'[{chat.id}] {chat.title}: bot join')
-            return
-        if new_user.id != msg.from_user.id:
-            logger.info(f'[{chat.id}] {chat.title}: others added user')
-            return
-        # Comfirm join message
-        logger.info(f'[{chat.id}] {chat.title}: RUNNING: kickout new user')
-        # Kickout new user
+    chat = update.effective_chat
+    for new_user in update.effective_message.new_chat_members:
+        add_user_to_db(chat.id, new_user.id, datetime.now().isoformat())
+        logger.info(f'User {new_user.id} added to chat {chat.id}')
+
+def kick_old_users(context: CallbackContext):
+    chat_id = context.job.context
+    users_to_kick = get_users_to_kick(chat_id, timedelta(days=7))
+    for user_id in users_to_kick:
         try:
-            chat.ban_member(user_id=new_user.id)
-            chat.unban_member(user_id=new_user.id)
+            context.bot.ban_chat_member(chat_id, user_id)
+            context.bot.unban_chat_member(chat_id, user_id)  # Разбан, чтобы пользователь мог вступить снова
+            remove_user_from_db(chat_id, user_id)
+            logger.info(f'User {user_id} kicked from chat {chat_id} after 7 days')
         except BadRequest as e:
-            if e.message == 'Chat_admin_required' or e.message[:17] == 'Not enough rights':
-                logger.debug(f'FAILED: {e.message}')
-                return  # Not enough rights, so do nothing
-            else:
-                logger.error(f'[{chat.id}] {chat.title}: {e.message}')
-                logger.debug(traceback.format_exc())
-        # Remove join message
-        try:
-            update.effective_message.delete()
-        except BadRequest as e:
-            if e.message[:24] == "Message can't be deleted" or e.message == 'Message to delete not found' or e.message == 'bot was kicked from the group chat':
-                logger.debug(f'FAILED: {e.message}')
-            else:
-                logger.error(f'[{chat.id}] {chat.title}: {e.message}')
-                logger.debug(traceback.format_exc())
-
-    except Exception as e:
-        logger.error(e)
-        logger.debug(traceback.format_exc())
-
-
-def remove_kickout_msg(update, context):
-    try:
-        chat = update.effective_chat
-        msg = update.effective_message
-        if msg.from_user.id != config['BOT'].getint('id'):
-            logger.info(f'[{chat.id}] {chat.title}: others remove user')
-            return
-        # Comfirm join message
-        logger.info(f'[{chat.id}] {chat.title}: RUNNING: remove kickout message')
-        # Remove kickout message
-        try:
-            update.effective_message.delete()
-        except BadRequest as e:
-            if e.message[:24] == "Message can't be deleted" or e.message == 'Message to delete not found' or e.message == 'bot was kicked from the group chat':
-                logger.debug(f'FAILED: {e.message}')
-            else:
-                logger.error(f'[{chat.id}] {chat.title}: {e.message}')
-                logger.debug(traceback.format_exc())
-    except Exception as e:
-        logger.error(e)
-        logger.debug(traceback.format_exc())
-
+            logger.error(f'Failed to kick user {user_id} from chat {chat_id}: {e.message}')
 
 def main():
+    # Загрузка конфигурации
+    config = configparser.ConfigParser()
+    config.read('config.ini')
+
+    # Создание базы данных
+    create_database()
+
+    # Настройка бота
     updater = Updater(config['BOT']['accesstoken'], use_context=True)
     dp = updater.dispatcher
     dp.add_error_handler(error_callback)
-
     dp.add_handler(MessageHandler(Filters.status_update.new_chat_members, kickout))
-    dp.add_handler(MessageHandler(Filters.status_update.left_chat_member, remove_kickout_msg))
 
-    if config['BOT'].getboolean('webhook'):
-        webhook = config._sections['WEBHOOK']
-        updater.start_webhook(listen=webhook['listen'], port=webhook['port'], url_path=webhook['token'],
-                              cert=webhook['cert'], webhook_url=f'https://{webhook["url"]}:8443/{webhook["port"]}/{webhook["token"]}')
-    else:
-        updater.start_polling()
+    # Настройка планировщика для ежедневной проверки и удаления пользователей
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(kick_old_users, 'interval', days=1, args=[updater], misfire_grace_time=3600)
+    scheduler.start()
+
+    # Запуск бота
+    updater.start_polling()
     updater.idle()
-
 
 if __name__ == '__main__':
     main()
